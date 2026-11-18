@@ -1,0 +1,292 @@
+services:
+  # ---------- Persistent infrastructure ----------
+  auth-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: authdb
+      POSTGRES_USER: auth
+      POSTGRES_PASSWORD: auth
+    volumes:
+      - auth_data:/var/lib/postgresql/data
+    networks: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U auth -d authdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  catalog-db:
+    image: mongo:7
+    restart: unless-stopped
+    volumes:
+      - catalog_data:/data/db
+    networks: [backend]
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  media-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: mediadb
+      POSTGRES_USER: media
+      POSTGRES_PASSWORD: media
+    volumes:
+      - media_data:/var/lib/postgresql/data
+    networks: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U media -d mediadb"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  watchlist-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: watchlistdb
+      POSTGRES_USER: watchlist
+      POSTGRES_PASSWORD: watchlist
+    volumes:
+      - watchlist_data:/var/lib/postgresql/data
+    networks: [backend]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U watchlist -d watchlistdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+    ports:
+      - "127.0.0.1:15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks: [backend]
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  minio:
+    # Community-maintained S3-compatible MinIO replacement
+    image: pgsty/silo:RELEASE.2026-10-18T00-00-00Z
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - minio_data:/data
+    networks: [storage]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  # ---------- Application backends ----------
+  auth-service:
+    build: ./services/auth-service
+    restart: unless-stopped
+    environment:
+      DB_URL: jdbc:postgresql://auth-db:5432/authdb
+      DB_USER: auth
+      DB_PASSWORD: auth
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: ${RABBITMQ_USER}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD}
+      JWT_SECRET: ${JWT_SECRET}
+      ADMIN_USERNAME: ${ADMIN_USERNAME}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+    depends_on:
+      auth-db: {condition: service_healthy}
+      rabbitmq: {condition: service_healthy}
+    networks: [frontend, backend]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8081/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  catalog-service:
+    build:
+      context: ./services/catalog-service
+      dockerfile: Dockerfile
+    image: netflix-catalog:step1
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      PORT: "3000"
+      MONGO_URL: mongodb://catalog-db:27017/catalogdb
+      RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672
+      JWT_SECRET: ${JWT_SECRET}
+    depends_on:
+      catalog-db: {condition: service_healthy}
+      rabbitmq: {condition: service_healthy}
+    networks: [frontend, backend]
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:3000/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  media-service:
+    build: ./services/media-service
+    image: netflix-media:learning
+    restart: unless-stopped
+    environment: &media-env
+      DB_HOST: media-db
+      DB_PORT: "5432"
+      DB_NAME: mediadb
+      DB_USER: media
+      DB_PASSWORD: media
+      DJANGO_SETTINGS_MODULE: media_service.settings
+      DJANGO_SECRET_KEY: ${JWT_SECRET}
+      JWT_SECRET: ${JWT_SECRET}
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      MINIO_BUCKET: netflix-media
+      MEDIA_PUBLIC_BASE: /netflix-media
+      RABBITMQ_URL: amqp://${RABBITMQ_USER}:${RABBITMQ_PASSWORD}@rabbitmq:5672/%2F
+    depends_on:
+      media-db: {condition: service_healthy}
+      minio: {condition: service_healthy}
+      rabbitmq: {condition: service_healthy}
+    networks: [frontend, backend, storage]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  media-worker:
+    build: ./services/media-service
+    image: netflix-media:learning
+    restart: unless-stopped
+    command: ["python", "manage.py", "consume_events"]
+    environment: *media-env
+    depends_on:
+      media-service: {condition: service_healthy}
+      rabbitmq: {condition: service_healthy}
+    networks: [backend, storage]
+
+  watchlist-service:
+    build: ./services/watchlist-service
+    restart: unless-stopped
+    environment:
+      ConnectionStrings__Default: Host=watchlist-db;Port=5432;Database=watchlistdb;Username=watchlist;Password=watchlist
+      Jwt__Secret: ${JWT_SECRET}
+      RabbitMq__Host: rabbitmq
+      RabbitMq__User: ${RABBITMQ_USER}
+      RabbitMq__Password: ${RABBITMQ_PASSWORD}
+      ASPNETCORE_URLS: http://+:8080
+    depends_on:
+      watchlist-db: {condition: service_healthy}
+      rabbitmq: {condition: service_healthy}
+    networks: [frontend, backend]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  # ---------- Micro-frontends ----------
+  mfe-auth:
+    build: ./frontends/mfe-auth
+    restart: unless-stopped
+    networks: [frontend]
+    healthcheck: &static-health
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  mfe-browse:
+    build: ./frontends/mfe-browse
+    restart: unless-stopped
+    networks: [frontend]
+    healthcheck: *static-health
+
+  shell:
+    build: ./frontends/shell
+    restart: unless-stopped
+    networks: [frontend]
+    healthcheck: *static-health
+
+  studio:
+    build: ./frontends/studio
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      HOSTNAME: 0.0.0.0
+    networks: [frontend]
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:3000/studio',r=>process.exit(r.statusCode<500?0:1)).on('error',()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  # ---------- Single public entry point ----------
+  gateway:
+    build: ./gateway
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:80"
+    depends_on:
+      auth-service: {condition: service_healthy}
+      catalog-service: {condition: service_healthy}
+      media-service: {condition: service_healthy}
+      watchlist-service: {condition: service_healthy}
+      shell: {condition: service_healthy}
+      mfe-auth: {condition: service_healthy}
+      mfe-browse: {condition: service_healthy}
+      studio: {condition: service_healthy}
+      minio: {condition: service_healthy}
+    networks: [frontend, storage]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/gateway/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+networks:
+  frontend:
+  backend:
+  storage:
+
+volumes:
+  auth_data:
+  catalog_data:
+  media_data:
+  watchlist_data:
+  rabbitmq_data:
+  minio_data:
